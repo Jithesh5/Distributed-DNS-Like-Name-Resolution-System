@@ -1,0 +1,225 @@
+from os_ken.base import app_manager
+from os_ken.controller import ofp_event
+from os_ken.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
+from os_ken.ofproto import ofproto_v1_3
+from os_ken.lib import hub
+import socket
+import threading
+import logging
+
+LOG = logging.getLogger("project22.sdn")
+CLIENT_IP = "10.0.0.2"
+PRIMARY_IP = "10.0.0.3"
+BACKUP_IP = "10.0.0.4"
+DNS_PORT = 5300
+CLIENT_PORT = 1
+PRIMARY_PORT = 2
+BACKUP_PORT = 3
+CONTROL_IP = "127.0.0.1"
+CONTROL_PORT = 9999
+DNS_COOKIE = 0xD15D0001
+
+class DistributedDNSController(app_manager.OSKenApp):
+    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+
+    def __init__(self, *args, **kwargs):
+        super(DistributedDNSController, self).__init__(*args, **kwargs)
+        self.datapaths = {}
+        self.backend_ip = PRIMARY_IP
+        self._bad_intervals = 0
+        self._control_thread = hub.spawn(self._control_loop)
+        self._stats_thread = hub.spawn(self._poll_flow_stats)
+
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
+    def switch_features_handler(self, ev):
+        dp = ev.msg.datapath
+        self.datapaths[dp.id] = dp
+        ofp = dp.ofproto
+        parser = dp.ofproto_parser
+        # Unknown traffic is sent to the controller; the controller learns L2 paths.
+        match = parser.OFPMatch()
+        actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
+        self._add_flow(dp, 0, match, actions)
+        self._install_dns_rules(dp, self.backend_ip)
+        LOG.info("Switch %s connected; DNS backend=%s", dp.id, self.backend_ip)
+
+    def _add_flow(self, dp, priority, match, actions, cookie=0, idle_timeout=0, hard_timeout=0):
+        ofp = dp.ofproto
+        parser = dp.ofproto_parser
+        instructions = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+        mod = parser.OFPFlowMod(datapath=dp, cookie=cookie, priority=priority,
+                                match=match, instructions=instructions,
+                                idle_timeout=idle_timeout, hard_timeout=hard_timeout)
+        dp.send_msg(mod)
+
+    def _install_dns_rules(self, dp, backend_ip):
+        ofp = dp.ofproto
+        parser = dp.ofproto_parser
+        # Remove previous service rules, preserving the table-miss rule.
+        delete = parser.OFPFlowMod(datapath=dp, command=ofp.OFPFC_DELETE,
+                                   cookie=DNS_COOKIE, cookie_mask=0xffffffffffffffff,
+                                   table_id=ofp.OFPTT_ALL,
+                                   out_port=ofp.OFPP_ANY, out_group=ofp.OFPG_ANY,
+                                   match=parser.OFPMatch())
+        dp.send_msg(delete)
+
+        if backend_ip == PRIMARY_IP:
+            backend_port, backend_mac = PRIMARY_PORT, "00:00:00:00:00:02"
+        elif backend_ip == BACKUP_IP:
+            backend_port, backend_mac = BACKUP_PORT, "00:00:00:00:00:03"
+        else:
+            LOG.error("Rejected unknown backend IP: %s", backend_ip)
+            return
+
+        # Client sends to primary service IP; controller rewrites destination to active backend.
+        req_match = parser.OFPMatch(eth_type=0x0800, ip_proto=17,
+                                    ipv4_dst=PRIMARY_IP, udp_dst=DNS_PORT)
+        req_actions = [
+            parser.OFPActionSetField(ipv4_dst=backend_ip),
+            parser.OFPActionSetField(eth_dst=backend_mac),
+            parser.OFPActionOutput(backend_port)
+        ]
+        self._add_flow(dp, 200, req_match, req_actions, cookie=DNS_COOKIE)
+
+        # Rewrite backend's response source back to the primary service IP for the client.
+        rep_match = parser.OFPMatch(eth_type=0x0800, ip_proto=17,
+                                    ipv4_src=backend_ip, udp_src=DNS_PORT,
+                                    ipv4_dst=CLIENT_IP)
+        rep_actions = [
+            parser.OFPActionSetField(ipv4_src=PRIMARY_IP),
+            parser.OFPActionOutput(CLIENT_PORT)
+        ]
+        self._add_flow(dp, 200, rep_match, rep_actions, cookie=DNS_COOKIE)
+        LOG.info("Installed DNS forwarding rules: %s -> %s (port %d)",
+                 PRIMARY_IP, backend_ip, backend_port)
+
+    def _reset_health_tracking(self):
+        self._bad_intervals = 0
+
+    def _poll_flow_stats(self):
+        """Poll OpenFlow counters once per second."""
+        while True:
+            for dp in list(self.datapaths.values()):
+                ofp = dp.ofproto
+                parser = dp.ofproto_parser
+                request = parser.OFPFlowStatsRequest(
+                    datapath=dp,
+                    table_id=ofp.OFPTT_ALL,
+                    out_port=ofp.OFPP_ANY,
+                    out_group=ofp.OFPG_ANY,
+                    cookie=DNS_COOKIE,
+                    cookie_mask=0xffffffffffffffff,
+                    match=parser.OFPMatch()
+                )
+                dp.send_msg(request)
+            hub.sleep(1.0)
+
+    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
+    def flow_stats_reply_handler(self, ev):
+        msg = ev.msg
+
+        if self.backend_ip != PRIMARY_IP:
+            return
+
+        request_packets = None
+        response_packets = None
+
+        for stat in msg.body:
+            match = stat.match
+
+            if (match.get("ipv4_dst") == PRIMARY_IP
+                    and match.get("udp_dst") == DNS_PORT):
+                request_packets = stat.packet_count
+
+            elif (match.get("ipv4_src") == PRIMARY_IP
+                    and match.get("udp_src") == DNS_PORT
+                    and match.get("ipv4_dst") == CLIENT_IP):
+                response_packets = stat.packet_count
+
+        if request_packets is None or response_packets is None:
+            return
+
+        # Requests without corresponding responses may indicate failure.
+        pending = request_packets - response_packets
+
+        if pending > 0:
+            self._bad_intervals += 1
+            LOG.warning(
+                "Primary DNS may be unresponsive: requests=%d responses=%d "
+                "consecutive_bad_intervals=%d",
+                request_packets, response_packets, self._bad_intervals
+            )
+        else:
+            self._bad_intervals = 0
+
+        # Require repeated evidence to reduce false failovers from delay.
+        if self._bad_intervals >= 3:
+            LOG.error("Primary DNS appears unhealthy; switching to backup")
+            self.backend_ip = BACKUP_IP
+            self._reset_health_tracking()
+
+            for dp in list(self.datapaths.values()):
+                self._install_dns_rules(dp, self.backend_ip)
+
+            LOG.warning("Automatic failover completed: backend=%s",
+                        self.backend_ip)
+
+    def _control_loop(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.bind((CONTROL_IP, CONTROL_PORT))
+            sock.settimeout(1.0)
+            LOG.info("Control socket listening on %s:%d", CONTROL_IP, CONTROL_PORT)
+            while True:
+                try:
+                    data, _ = sock.recvfrom(1024)
+                except socket.timeout:
+                    continue
+                command = data.decode("utf-8", "replace").strip().upper()
+                if command == "BACKEND PRIMARY":
+                    self.backend_ip = PRIMARY_IP
+                elif command == "BACKEND BACKUP":
+                    self.backend_ip = BACKUP_IP
+                else:
+                    LOG.warning("Unknown control command: %r", command)
+                    continue
+                self._reset_health_tracking()
+                for dp in list(self.datapaths.values()):
+                    self._install_dns_rules(dp, self.backend_ip)
+                LOG.info("Dynamic backend changed to %s", self.backend_ip)
+        finally:
+            sock.close()
+
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    def packet_in_handler(self, ev):
+        # Minimal L2 learning for ARP and non-DNS traffic. DNS service traffic is
+        # handled by the higher-priority service flows installed above.
+        msg = ev.msg
+        dp = msg.datapath
+        ofp = dp.ofproto
+        parser = dp.ofproto_parser
+        in_port = msg.match.get("in_port")
+        from os_ken.lib.packet import packet, ethernet
+        pkt = packet.Packet(msg.data)
+        eth = pkt.get_protocol(ethernet.ethernet)
+        if eth is None:
+            return
+        if eth.ethertype == 0x0806:  # ARP: flood so hosts can learn one another.
+            actions = [parser.OFPActionOutput(ofp.OFPP_FLOOD)]
+        else:
+            # This lab topology has three fixed access ports.
+            dst = eth.dst.lower()
+            mac_to_port = {
+                "00:00:00:00:00:01": 1,
+                "00:00:00:00:00:02": 2,
+                "00:00:00:00:00:03": 3,
+            }
+            out_port = mac_to_port.get(dst, ofp.OFPP_FLOOD)
+            actions = [parser.OFPActionOutput(out_port)]
+        if msg.buffer_id != ofp.OFP_NO_BUFFER:
+            out = parser.OFPPacketOut(datapath=dp, buffer_id=msg.buffer_id,
+                                      in_port=in_port, actions=actions)
+        else:
+            out = parser.OFPPacketOut(datapath=dp, buffer_id=ofp.OFP_NO_BUFFER,
+                                      in_port=in_port, actions=actions, data=msg.data)
+        dp.send_msg(out)

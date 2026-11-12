@@ -1,0 +1,2 @@
+domain,status,source,latency_ms,server_number
+timeout-test.local,ALL_SERVERS_FAILED,NONE,2035.014,0

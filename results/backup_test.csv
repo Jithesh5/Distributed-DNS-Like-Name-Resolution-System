@@ -1,0 +1,4 @@
+domain,status,source,latency_ms,server_number
+backup.college.local,OK,SERVER,2.653,1
+backup.college.local,OK,SERVER,2.151,1
+backup.college.local,OK,SERVER,0.658,1

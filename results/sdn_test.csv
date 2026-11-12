@@ -1,0 +1,2 @@
+domain,status,source,latency_ms,server_number
+www.college.local,OK,SERVER,3.168,1

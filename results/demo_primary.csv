@@ -1,0 +1,6 @@
+domain,status,source,latency_ms,server_number
+google.com,OK,SERVER,6.136,1
+[,NOT_FOUND,SERVERS,0.803,1
+google.com,OK,SERVER,0.344,1
+google.com,ALL_SERVERS_FAILED,NONE,2048.419,0
+www,ALL_SERVERS_FAILED,NONE,2074.323,0
